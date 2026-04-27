@@ -1,0 +1,2 @@
+# Large CSVs exceed GitHub's 100 MB limit for normal Git blobs; store them with Git LFS.
+data/*.csv filter=lfs diff=lfs merge=lfs -text
