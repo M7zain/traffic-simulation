@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+
+# Large / generated (keep locally; Docker bind-mounts src/model)
+data/*.csv
+src/model/*.joblib
+# Local scratch / secrets
+Untitled
+needs-integration.py

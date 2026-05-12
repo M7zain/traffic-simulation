@@ -19,8 +19,11 @@ while True:
             "time": str(row["DATE_TIME"]),
             "lat": float(row["LATITUDE"]),
             "lon": float(row["LONGITUDE"]),
+            "min_speed": float(row["MINIMUM_SPEED"]),
+            "max_speed": float(row["MAXIMUM_SPEED"]),
             "avg_speed": float(row["AVERAGE_SPEED"]),
             "vehicles": int(row["NUMBER_OF_VEHICLES"]),
+            "geohash": str(row["GEOHASH"]) if pd.notna(row["GEOHASH"]) else "unknown",
         }
         producer.send("traffic-topic", value=data)
         print("sent:", data, flush=True)

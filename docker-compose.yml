@@ -58,15 +58,17 @@ services:
       - org.apache.spark.deploy.worker.Worker
       - spark://spark:7077
 
-  # Reads Kafka + writes Mongo via Spark cluster (driver here, executors on workers).
+  # TomTom-style flow messages from Kafka -> preprocessing + joblib model -> MongoDB.
   spark-streaming:
-    image: apache/spark:3.5.1
+    build: ./src/spark_jobs
     container_name: spark-streaming
-    # Named volume at /checkpoints is root-owned; driver needs to create checkpoint subdirs (local dev only).
     user: "0:0"
-    # Default $HOME is not writable in this image; Ivy needs a writable home for --packages.
     environment:
       HOME: /tmp/spark-home
+      MODEL_PATH: /models/traffic_model.joblib
+      KAFKA_TOPIC: traffic-flow-topic
+      MONGO_PREPROCESSED_URI: mongodb://mongo:27017/traffic_db.tomtom_preprocessed
+      MONGO_PREDICTIONS_URI: mongodb://mongo:27017/traffic_db.tomtom_predictions
     depends_on:
       kafka:
         condition: service_healthy
@@ -78,18 +80,35 @@ services:
         condition: service_started
     volumes:
       - ./src/spark_jobs:/jobs
+      - ./src/model:/models:ro
       - streaming-checkpoints:/checkpoints
     command:
       - /bin/bash
       - -c
       - >-
-        mkdir -p /tmp/spark-home/.ivy2/cache /tmp/spark-home/.ivy2/jars /checkpoints/traffic-kafka &&
+        mkdir -p /tmp/spark-home/.ivy2/cache /tmp/spark-home/.ivy2/jars /checkpoints/traffic-flow &&
         exec /opt/spark/bin/spark-submit
         --master spark://spark:7077
         --deploy-mode client
         --conf spark.jars.ivy=/tmp/spark-home/.ivy2
         --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.mongodb.spark:mongo-spark-connector_2.12:10.3.0
         /jobs/spark_app.py
+    restart: unless-stopped
+
+  api-feed:
+    build: ./src/api_feed
+    container_name: api-feed
+    environment:
+      TOMTOM_API_KEY: ${TOMTOM_API_KEY:-}
+      TOMTOM_LAT: ${TOMTOM_LAT:-41.0450}
+      TOMTOM_LON: ${TOMTOM_LON:-29.0350}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: traffic-flow-topic
+      SAMPLES_PER_CYCLE: ${SAMPLES_PER_CYCLE:-120}
+      CYCLE_SECONDS: ${CYCLE_SECONDS:-600}
+    depends_on:
+      kafka:
+        condition: service_healthy
     restart: unless-stopped
 
   superset:
@@ -100,7 +119,10 @@ services:
     environment:
       SUPERSET_SECRET_KEY: "superset_secret"
 
+  # Optional CSV replay; use: docker compose --profile csv up
   producer:
+    profiles:
+      - csv
     build: ./src/producer
     container_name: producer
     depends_on:

@@ -1,8 +1,10 @@
 # Trafik akış (streaming) hattı
 
-**Docker Compose** ile çalışan servisler: **Kafka**, **Spark**, **MongoDB**, **Superset** ve CSV satırlarını Kafkaya gönderen **Python producer**; **Spark Structured Streaming** bu topiği okuyup toplu verileri **MongoDB**ye yazar.
+**Docker Compose** ile çalışan servisler: **TomTom API** verisini Kafkaya atan **api-feed**, **Kafka**, **Spark** (ön işleme + **joblib** model), **MongoDB** (ham özellikler + tahminler), **Superset** ve isteğe bağlı **CSV producer** (ayrı profil). **Spark Structured Streaming** `traffic-flow-topic` topiğini okur; veriyi modelle uyumlu şekilde işler, tahmin üretir ve **MongoDB**ye iki koleksiyonda yazar.
 
 **Gereksinim:** [Docker Desktop](https://docs.docker.com/desktop/) (Windows / WSL2).
+
+**API anahtarı:** Depo kökünde `.env` dosyası oluşturun (örnek: `.env.example`). `TOMTOM_API_KEY` burada olmalı; Compose bu dosyayı değişkenler için okur.
 
 ---
 
@@ -14,14 +16,16 @@
 | Her şeyi durdur | `docker compose down` |
 | Çalışan servisleri listele | `docker compose ps` |
 
+**Sadece CSV ile eski producer** (Kafka `traffic-topic` vb.): `docker compose --profile csv up -d --build`
+
 ---
 
 ## Log ve izleme
 
-**Producer, Kafka ve Spark streaming** çıktısını aynı anda izlemek:
+**api-feed, Kafka ve Spark streaming** çıktısını aynı anda izlemek:
 
 ```bash
-docker compose logs -f producer kafka spark-streaming
+docker compose logs -f api-feed kafka spark-streaming
 ```
 
 **Sadece Spark streaming:**
@@ -36,19 +40,22 @@ docker compose logs -f spark-streaming
 
 ## Hattı doğrulama
 
-**Kafkadan mesaj oku** (producerın gönderdiği `traffic-topic`):
+**Kafkadan mesaj oku** (api-feedin gönderdiği `traffic-flow-topic`):
 
 ```bash
-docker compose exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic traffic-topic --from-beginning
+docker compose exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic traffic-flow-topic --from-beginning --max-messages 5
 ```
 
 Durdurmak için: `Ctrl+C`
 
-**MongoDBde Sparkın yazdığı kayıt sayısı** (`traffic_db` veritabanı, `traffic` koleksiyonu):
+**MongoDBde kayıt sayıları** (`traffic_db` veritabanı):
 
 ```bash
-docker compose exec mongo mongosh --quiet --eval "db.traffic.countDocuments()" traffic_db
+docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').tomtom_preprocessed.countDocuments({})"
+docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').tomtom_predictions.countDocuments({})"
 ```
+
+Spark loglarında `[batch …] predictions` satırları görünüyorsa model tarafı da çalışıyordur.
 
 ---
 
@@ -56,9 +63,11 @@ docker compose exec mongo mongosh --quiet --eval "db.traffic.countDocuments()" t
 
 | Yol | İş |
 |-----|-----|
-| `src/producer/` | JSON satırlarını `traffic-topic`e yollar |
-| `src/spark_jobs/spark_app.py` | Kafka → MongoDB akış işi |
-| `data/` | Producer için `traffic_density_202408.csv` buraya (Gitte isteğe bağlı) |
+| `src/api_feed/` | TomTom flow API → Kafka `traffic-flow-topic` |
+| `src/spark_jobs/spark_app.py` | Kafka → ön işleme + model → MongoDB |
+| `src/model/traffic_model.joblib` | Spark konteynerinde `/models` olarak bağlanır |
+| `src/producer/` | İsteğe bağlı CSV → Kafka (Compose profili `csv`) |
+| `data/` | CSV producer için (isteğe bağlı) |
 | `docker-compose.yml` | Servis tanımları |
 
 ---
@@ -71,4 +80,4 @@ Depo kökünde:
 .\watch-flow.ps1
 ```
 
-Stacki açar ve `producer`, `kafka`, `spark-streaming` loglarını takip eder.
+Stacki açar ve `api-feed`, `kafka`, `spark-streaming` loglarını takip eder.
