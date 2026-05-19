@@ -31,6 +31,23 @@ services:
     ports:
       - "27017:27017"
 
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_DB: traffic_viz
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./src/superset/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset -d traffic_viz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   spark:
     image: apache/spark:3.5.1
     container_name: spark
@@ -71,6 +88,7 @@ services:
       MONGO_DB: traffic_db
       MONGO_PREPROCESSED_COLLECTION: tomtom_preprocessed
       MONGO_PREDICTIONS_COLLECTION: tomtom_predictions
+      POSTGRES_URI: postgresql+psycopg2://superset:superset@postgres:5432/traffic_viz
     depends_on:
       kafka:
         condition: service_healthy
@@ -80,6 +98,8 @@ services:
         condition: service_started
       mongo:
         condition: service_started
+      postgres:
+        condition: service_healthy
     volumes:
       - ./src/spark_jobs:/jobs
       - ./src/model:/models:ro
@@ -112,12 +132,29 @@ services:
     restart: unless-stopped
 
   superset:
-    image: apache/superset:3.0.1
+    build: ./src/superset
     container_name: superset
     ports:
       - "8088:8088"
     environment:
       SUPERSET_SECRET_KEY: "superset_secret"
+      SUPERSET_ADMIN_USERNAME: admin
+      SUPERSET_ADMIN_PASSWORD: admin
+      SUPERSET_ADMIN_EMAIL: admin@traffic.local
+      SUPERSET_PG_URI: postgresql+psycopg2://superset:superset@postgres:5432/traffic_viz
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: traffic_viz
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@postgres:5432/traffic_viz
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - superset_home:/app/superset_home
+    command: ["/bin/bash", "/app/superset_init/init.sh"]
+    restart: unless-stopped
 
   # Optional CSV replay; use: docker compose --profile csv up
   producer:
@@ -136,3 +173,4 @@ services:
 
 volumes:
   streaming-checkpoints:
+  superset_home:

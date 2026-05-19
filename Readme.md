@@ -1,6 +1,6 @@
 # Trafik akış (streaming) hattı
 
-**Docker Compose** ile çalışan servisler: **TomTom API** verisini Kafkaya atan **api-feed**, **Kafka**, **Spark** (ön işleme + **joblib** model), **MongoDB** (ham özellikler + tahminler), **Superset** ve isteğe bağlı **CSV producer** (ayrı profil). **Spark Structured Streaming** `traffic-flow-topic` topiğini okur; veriyi modelle uyumlu şekilde işler, tahmin üretir ve **MongoDB**ye iki koleksiyonda yazar.
+**Docker Compose** ile çalışan servisler: **TomTom API** → **Kafka** → **Spark** (model) → **MongoDB** + **PostgreSQL** (Superset grafikleri), **Superset** arayüzü ve isteğe bağlı **CSV producer** (ayrı profil). **Spark Structured Streaming** `traffic-flow-topic` topiğini okur; veriyi modelle uyumlu şekilde işler, tahmin üretir ve **MongoDB**ye iki koleksiyonda yazar.
 
 **Gereksinim:** [Docker Desktop](https://docs.docker.com/desktop/) (Windows / WSL2).
 
@@ -67,7 +67,33 @@ docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').
 docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').tomtom_preprocessed.find({},{location_name:1,Day:1,CurrentSpeed:1,Confidence:1,IsWeekend:1,capture_time:1,_id:0}).sort({capture_time:-1}).limit(5).forEach(d=>printjson(d))"
 ```
 
-Spark loglarında `Model loaded` ve `[batch …] Mongo OK` görünüyorsa akış çalışıyordur.
+Spark loglarında `Model loaded` ve `Mongo + Postgres OK` görünüyorsa akış çalışıyordur.
+
+---
+
+## Superset (grafik arayüz)
+
+Spark tahminleri **MongoDB**ye ve Superset için **PostgreSQL**e (`traffic_viz`) yazar. Superset MongoDBye doğrudan bağlanmaz.
+
+Stack çalışırken tarayıcıda **http://localhost:8088** adresine gidin; giriş ekranında aşağıdaki bilgileri kullanın.
+
+| | |
+|--|--|
+| URL | [http://localhost:8088](http://localhost:8088) |
+| Kullanıcı adı | `admin` |
+| Şifre | `admin` |
+| Veritabanı bağlantısı | `Traffic Postgres` (otomatik eklenir) |
+| Datasetler | `tomtom_predictions`, `tomtom_preprocessed` |
+
+**İlk grafik (örnek):**
+
+1. **Charts** → **+ Chart** → dataset: `tomtom_predictions`
+2. **Bar chart** → X: `location_name`, Metric: **Count**
+3. Kaydet → **Dashboards** → **+ Dashboard** → grafiği ekle
+
+**Tahmin dağılımı:** Chart tipi **Pie**, Dimension: `prediction`
+
+Superset ilk açılışta 1–2 dakika sürebilir (`docker compose logs -f superset`).
 
 ---
 
@@ -80,6 +106,7 @@ Spark loglarında `Model loaded` ve `[batch …] Mongo OK` görünüyorsa akış
 | `src/model/traffic_classifier_new.joblib` | Spark konteynerinde `/models` olarak bağlanır (Git’e eklenmez) |
 | `src/producer/` | İsteğe bağlı CSV → Kafka (Compose profili `csv`) |
 | `data/` | CSV producer için (isteğe bağlı) |
+| `src/superset/` | Superset imajı, Postgres tabloları, otomatik dataset |
 | `docker-compose.yml` | Servis tanımları |
 
 ---

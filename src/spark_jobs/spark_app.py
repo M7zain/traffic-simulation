@@ -32,6 +32,23 @@ MONGO_PREDICTIONS_COLLECTION = os.environ.get(
 )
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/traffic_classifier_new.joblib")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "traffic-flow-topic")
+POSTGRES_URI = os.environ.get(
+    "POSTGRES_URI",
+    "postgresql+psycopg2://superset:superset@postgres:5432/traffic_viz",
+)
+
+FEATURE_TO_PG = {
+    "Day": "day",
+    "CurrentSpeed": "current_speed",
+    "FreeFlowSpeed": "free_flow_speed",
+    "CurrentTravelTime": "current_travel_time",
+    "FreeFlowTravelTime": "free_flow_travel_time",
+    "Confidence": "confidence",
+    "Hour": "hour",
+    "Minute": "minute",
+    "DayOfWeek": "day_of_week",
+    "IsWeekend": "is_weekend",
+}
 
 _MODEL = None
 _FEATURES = None
@@ -59,6 +76,24 @@ def write_mongo_pandas(pdf, collection):
     client = MongoClient(MONGO_URI)
     client[MONGO_DB][collection].insert_many(records)
     client.close()
+
+
+def to_pg_frame(pdf):
+    rename = {k: v for k, v in FEATURE_TO_PG.items() if k in pdf.columns}
+    return pdf.rename(columns=rename)
+
+
+def write_postgres_pandas(pdf, table):
+    if pdf.empty:
+        return
+    try:
+        from sqlalchemy import create_engine
+
+        engine = create_engine(POSTGRES_URI)
+        to_pg_frame(pdf).to_sql(table, engine, if_exists="append", index=False, method="multi")
+        engine.dispose()
+    except Exception as exc:
+        print(f"Postgres write warning ({table}): {exc}", flush=True)
 
 
 spark = SparkSession.builder.appName("TrafficFlowML").getOrCreate()
@@ -162,9 +197,12 @@ def write_to_mongo(batch_df, batch_id):
             + features
         ]
 
-        write_mongo_pandas(pdf.drop(columns=["prediction"]), MONGO_PREPROCESSED_COLLECTION)
+        pre_pdf = pdf.drop(columns=["prediction"])
+        write_mongo_pandas(pre_pdf, MONGO_PREPROCESSED_COLLECTION)
         write_mongo_pandas(pred_pdf, MONGO_PREDICTIONS_COLLECTION)
-        print(f"[batch {batch_id}] Mongo OK -> {MONGO_DB}", flush=True)
+        write_postgres_pandas(pre_pdf, "tomtom_preprocessed")
+        write_postgres_pandas(pred_pdf, "tomtom_predictions")
+        print(f"[batch {batch_id}] Mongo + Postgres OK", flush=True)
 
     except Exception:
         print(f"[batch {batch_id}] ERROR:", flush=True)
