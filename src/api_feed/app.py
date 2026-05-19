@@ -1,6 +1,6 @@
 """
 TomTom Traffic Flow API -> Kafka (traffic-flow-topic).
-120 samples per 10-minute cycle (~5s between calls) to stay within practical API pacing.
+Multiple Istanbul locations (new updates.py). ~120 samples per 10-minute cycle.
 """
 import json
 import os
@@ -11,26 +11,34 @@ import requests
 from kafka import KafkaProducer
 
 API_KEY = os.environ.get("TOMTOM_API_KEY", "")
-LAT = float(os.environ.get("TOMTOM_LAT", "41.0450"))
-LON = float(os.environ.get("TOMTOM_LON", "29.0350"))
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC = os.environ.get("KAFKA_TOPIC", "traffic-flow-topic")
 SAMPLES_PER_CYCLE = int(os.environ.get("SAMPLES_PER_CYCLE", "120"))
 CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "600"))
-# Space calls evenly across the cycle (fallback 5s if env math is off)
-SLEEP_BETWEEN = max(1.0, float(os.environ.get("SLEEP_BETWEEN_SEC", str(CYCLE_SECONDS / max(1, SAMPLES_PER_CYCLE)))))
+SLEEP_BETWEEN = max(
+    1.0,
+    float(os.environ.get("SLEEP_BETWEEN_SEC", str(CYCLE_SECONDS / max(1, SAMPLES_PER_CYCLE)))),
+)
+
+# Same locations as new updates.py
+LOKASYONLAR = [
+    {"location_name": "Bagdat_Caddesi", "lat": 40.9706, "lon": 29.0703},
+    {"location_name": "Barbaros_Bulvari", "lat": 41.0439, "lon": 29.0065},
+    {"location_name": "Buyukdere_Caddesi", "lat": 41.0671, "lon": 29.0135},
+    {"location_name": "E5_Kadikoy", "lat": 40.9920, "lon": 29.1006},
+    {"location_name": "TEM_Maslak", "lat": 41.1115, "lon": 29.0207},
+]
 
 
-def fetch_flow_segment():
+def fetch_flow_segment(lat, lon):
     url = (
         "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
-        f"?point={LAT},{LON}&key={API_KEY}"
+        f"?point={lat},{lon}&key={API_KEY}"
     )
-    response = requests.get(url, timeout=30)
+    response = requests.get(url, timeout=10)
     if response.status_code != 200:
         return None, response.status_code
-    data = response.json()
-    seg = data.get("flowSegmentData") or {}
+    seg = response.json().get("flowSegmentData") or {}
     return seg, 200
 
 
@@ -47,34 +55,41 @@ def main():
     cycle = 0
     while True:
         cycle += 1
-        print(f"--- API ingest cycle {cycle}: up to {SAMPLES_PER_CYCLE} samples ---", flush=True)
+        print(
+            f"--- API ingest cycle {cycle}: {SAMPLES_PER_CYCLE} samples "
+            f"across {len(LOKASYONLAR)} locations ---",
+            flush=True,
+        )
         t_start = time.time()
 
         for i in range(SAMPLES_PER_CYCLE):
-            seg, status = fetch_flow_segment()
-            now = datetime.utcnow()
-            capture_time = now.isoformat() + "Z"
+            loc = LOKASYONLAR[i % len(LOKASYONLAR)]
+            seg, status = fetch_flow_segment(loc["lat"], loc["lon"])
+            capture_time = datetime.now().isoformat()
 
             if seg is None:
-                print(f"API error status={status}, sleeping 60s", flush=True)
+                print(
+                    f"API error status={status} loc={loc['location_name']}, sleeping 60s",
+                    flush=True,
+                )
                 time.sleep(60)
                 continue
 
             payload = {
                 "capture_time": capture_time,
-                "lat": LAT,
-                "lon": LON,
+                "location_name": loc["location_name"],
+                "lat": loc["lat"],
+                "lon": loc["lon"],
                 "sample_id": i + 1,
-                "current_speed": seg.get("currentSpeed"),
-                "free_flow_speed": seg.get("freeFlowSpeed"),
-                "current_travel_time": seg.get("currentTravelTime"),
-                "free_flow_travel_time": seg.get("freeFlowTravelTime"),
-                "confidence": seg.get("confidence"),
+                "current_speed": seg.get("currentSpeed", 0),
+                "free_flow_speed": seg.get("freeFlowSpeed", 1),
+                "current_travel_time": seg.get("currentTravelTime", 0),
+                "free_flow_travel_time": seg.get("freeFlowTravelTime", 0),
+                "confidence": seg.get("confidence", 0.95),
             }
             producer.send(TOPIC, value=payload)
-            print(f"sent sample {i + 1}/{SAMPLES_PER_CYCLE}: {payload}", flush=True)
+            print(f"sent {loc['location_name']} sample {i + 1}/{SAMPLES_PER_CYCLE}", flush=True)
             producer.flush()
-
             time.sleep(SLEEP_BETWEEN)
 
         elapsed = time.time() - t_start

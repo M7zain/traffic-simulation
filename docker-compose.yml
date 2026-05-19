@@ -65,10 +65,12 @@ services:
     user: "0:0"
     environment:
       HOME: /tmp/spark-home
-      MODEL_PATH: /models/traffic_model.joblib
+      MODEL_PATH: /models/traffic_classifier_new.joblib
       KAFKA_TOPIC: traffic-flow-topic
-      MONGO_PREPROCESSED_URI: mongodb://mongo:27017/traffic_db.tomtom_preprocessed
-      MONGO_PREDICTIONS_URI: mongodb://mongo:27017/traffic_db.tomtom_predictions
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: traffic_db
+      MONGO_PREPROCESSED_COLLECTION: tomtom_preprocessed
+      MONGO_PREDICTIONS_COLLECTION: tomtom_predictions
     depends_on:
       kafka:
         condition: service_healthy
@@ -86,7 +88,7 @@ services:
       - /bin/bash
       - -c
       - >-
-        mkdir -p /tmp/spark-home/.ivy2/cache /tmp/spark-home/.ivy2/jars /checkpoints/traffic-flow &&
+        mkdir -p /tmp/spark-home/.ivy2/cache /tmp/spark-home/.ivy2/jars /checkpoints/traffic-flow-v2 &&
         exec /opt/spark/bin/spark-submit
         --master spark://spark:7077
         --deploy-mode client
@@ -100,8 +102,6 @@ services:
     container_name: api-feed
     environment:
       TOMTOM_API_KEY: ${TOMTOM_API_KEY:-}
-      TOMTOM_LAT: ${TOMTOM_LAT:-41.0450}
-      TOMTOM_LON: ${TOMTOM_LON:-29.0350}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: traffic-flow-topic
       SAMPLES_PER_CYCLE: ${SAMPLES_PER_CYCLE:-120}

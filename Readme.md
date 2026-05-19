@@ -4,7 +4,7 @@
 
 **Gereksinim:** [Docker Desktop](https://docs.docker.com/desktop/) (Windows / WSL2).
 
-**API anahtarı:** Depo kökünde `.env` dosyası oluşturun (örnek: `.env.example`). `TOMTOM_API_KEY` burada olmalı; Compose bu dosyayı değişkenler için okur.
+**API anahtarı:** Depo kökünde `.env` dosyası oluşturun (örnek: `.env.example`). Yalnızca `TOMTOM_API_KEY` gerekir. Beş İstanbul lokasyonu `src/api_feed/app.py` içinde tanımlıdır (`.env` ile verilmez).
 
 ---
 
@@ -55,7 +55,19 @@ docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').
 docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').tomtom_predictions.countDocuments({})"
 ```
 
-Spark loglarında `[batch …] predictions` satırları görünüyorsa model tarafı da çalışıyordur.
+**Son kayıtları görüntüle** (tahminler — lokasyon, trafik sınıfı, hız, zaman):
+
+```bash
+docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').tomtom_predictions.find({},{location_name:1,prediction:1,CurrentSpeed:1,Hour:1,Minute:1,capture_time:1,_id:0}).sort({capture_time:-1}).limit(10).forEach(d=>printjson(d))"
+```
+
+**Ön işlenmiş örnek** (model girdisi alanları):
+
+```bash
+docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('traffic_db').tomtom_preprocessed.find({},{location_name:1,Day:1,CurrentSpeed:1,Confidence:1,IsWeekend:1,capture_time:1,_id:0}).sort({capture_time:-1}).limit(5).forEach(d=>printjson(d))"
+```
+
+Spark loglarında `Model loaded` ve `[batch …] Mongo OK` görünüyorsa akış çalışıyordur.
 
 ---
 
@@ -65,7 +77,7 @@ Spark loglarında `[batch …] predictions` satırları görünüyorsa model tar
 |-----|-----|
 | `src/api_feed/` | TomTom flow API → Kafka `traffic-flow-topic` |
 | `src/spark_jobs/spark_app.py` | Kafka → ön işleme + model → MongoDB |
-| `src/model/traffic_model.joblib` | Spark konteynerinde `/models` olarak bağlanır |
+| `src/model/traffic_classifier_new.joblib` | Spark konteynerinde `/models` olarak bağlanır (Git’e eklenmez) |
 | `src/producer/` | İsteğe bağlı CSV → Kafka (Compose profili `csv`) |
 | `data/` | CSV producer için (isteğe bağlı) |
 | `docker-compose.yml` | Servis tanımları |

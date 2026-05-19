@@ -1,13 +1,15 @@
 """
-Kafka (TomTom-style flow messages) -> Spark preprocessing (aligned with needs-integration.py)
--> joblib model -> MongoDB (preprocessed + predictions).
+Kafka -> Spark preprocessing (new updates.py) -> classifier -> MongoDB.
 """
 import os
+import traceback
 
 import joblib
 import pandas as pd
+from pymongo import MongoClient
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
+    coalesce,
     col,
     dayofweek,
     from_json,
@@ -19,41 +21,44 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType
 
-# Model expects this exact column order (needs-integration.py / training).
-MODEL_FEATURES = [
-    "ID",
-    "Day",
-    "CurrentSpeed",
-    "FreeFlowSpeed",
-    "CurrentTravelTime",
-    "FreeFlowTravelTime",
-    "Confidence",
-    "Hour",
-    "Minute",
-    "DayOfWeek",
-    "IsWeekend",
-]
-
-CHECKPOINT_DIR = "/checkpoints/traffic-flow"
-MONGO_PREPROCESSED_URI = os.environ.get(
-    "MONGO_PREPROCESSED_URI",
-    "mongodb://mongo:27017/traffic_db.tomtom_preprocessed",
+CHECKPOINT_DIR = "/checkpoints/traffic-flow-v2"
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
+MONGO_DB = os.environ.get("MONGO_DB", "traffic_db")
+MONGO_PREPROCESSED_COLLECTION = os.environ.get(
+    "MONGO_PREPROCESSED_COLLECTION", "tomtom_preprocessed"
 )
-MONGO_PREDICTIONS_URI = os.environ.get(
-    "MONGO_PREDICTIONS_URI",
-    "mongodb://mongo:27017/traffic_db.tomtom_predictions",
+MONGO_PREDICTIONS_COLLECTION = os.environ.get(
+    "MONGO_PREDICTIONS_COLLECTION", "tomtom_predictions"
 )
-MODEL_PATH = os.environ.get("MODEL_PATH", "/models/traffic_model.joblib")
+MODEL_PATH = os.environ.get("MODEL_PATH", "/models/traffic_classifier_new.joblib")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "traffic-flow-topic")
 
 _MODEL = None
+_FEATURES = None
 
 
-def get_model():
-    global _MODEL
+def get_model_bundle():
+    global _MODEL, _FEATURES
     if _MODEL is None:
-        _MODEL = joblib.load(MODEL_PATH)
-    return _MODEL
+        bundle = joblib.load(MODEL_PATH)
+        if isinstance(bundle, dict) and "model" in bundle and "features" in bundle:
+            _MODEL = bundle["model"]
+            _FEATURES = list(bundle["features"])
+        else:
+            raise ValueError(
+                f"Expected joblib dict with 'model' and 'features' at {MODEL_PATH}"
+            )
+        print(f"Model loaded from {MODEL_PATH}, features={_FEATURES}", flush=True)
+    return _MODEL, _FEATURES
+
+
+def write_mongo_pandas(pdf, collection):
+    if pdf.empty:
+        return
+    records = pdf.to_dict(orient="records")
+    client = MongoClient(MONGO_URI)
+    client[MONGO_DB][collection].insert_many(records)
+    client.close()
 
 
 spark = SparkSession.builder.appName("TrafficFlowML").getOrCreate()
@@ -62,6 +67,7 @@ spark.sparkContext.setLogLevel("WARN")
 kafka_schema = StructType(
     [
         StructField("capture_time", StringType()),
+        StructField("location_name", StringType()),
         StructField("lat", DoubleType()),
         StructField("lon", DoubleType()),
         StructField("sample_id", LongType()),
@@ -90,86 +96,80 @@ parsed = (
 
 
 def write_to_mongo(batch_df, batch_id):
-    if batch_df.rdd.isEmpty():
+    if batch_df.limit(1).count() == 0:
         return
 
-    base = batch_df.withColumn("event_time", to_timestamp(col("capture_time"))).dropna(
-        subset=[
-            "event_time",
-            "lat",
-            "lon",
-            "sample_id",
-            "current_speed",
-            "free_flow_speed",
-            "current_travel_time",
-            "free_flow_travel_time",
-            "confidence",
+    try:
+        base = (
+            batch_df.withColumn("event_time", to_timestamp(col("capture_time")))
+            .withColumn("current_speed", coalesce(col("current_speed"), lit(0.0)))
+            .withColumn("free_flow_speed", coalesce(col("free_flow_speed"), lit(1.0)))
+            .withColumn("current_travel_time", coalesce(col("current_travel_time"), lit(0.0)))
+            .withColumn(
+                "free_flow_travel_time", coalesce(col("free_flow_travel_time"), lit(0.0))
+            )
+            .withColumn("confidence", coalesce(col("confidence"), lit(0.95)))
+            .dropna(subset=["event_time", "lat", "lon", "location_name"])
+        )
+
+        if base.limit(1).count() == 0:
+            return
+
+        # Python weekday(): Monday=0 .. Sunday=6 (matches new updates.py Day + DayOfWeek)
+        dow_py = ((dayofweek(col("event_time")) + lit(5)) % lit(7)).cast("int")
+
+        enriched = (
+            base.withColumn("Hour", hour(col("event_time")))
+            .withColumn("Minute", minute(col("event_time")))
+            .withColumn("DayOfWeek", dow_py)
+            .withColumn("Day", col("DayOfWeek"))
+            .withColumn("IsWeekend", when(col("DayOfWeek") >= lit(5), lit(1)).otherwise(lit(0)))
+            .withColumnRenamed("current_speed", "CurrentSpeed")
+            .withColumnRenamed("free_flow_speed", "FreeFlowSpeed")
+            .withColumnRenamed("current_travel_time", "CurrentTravelTime")
+            .withColumnRenamed("free_flow_travel_time", "FreeFlowTravelTime")
+            .withColumnRenamed("confidence", "Confidence")
+        )
+
+        model, features = get_model_bundle()
+
+        meta_cols = ["capture_time", "location_name", "lat", "lon", "sample_id"]
+        feature_df = enriched.select(*meta_cols, *features)
+
+        pdf = feature_df.toPandas()
+        if pdf.empty:
+            return
+
+        for c in features:
+            pdf[c] = pd.to_numeric(pdf[c], errors="coerce")
+
+        pdf = pdf.dropna(subset=features)
+        if pdf.empty:
+            return
+
+        X = pdf[features]
+        pdf["prediction"] = model.predict(X)
+        pdf["batch_id"] = int(batch_id)
+
+        print(f"[batch {batch_id}] wrote {len(pdf)} rows", flush=True)
+        print(
+            pdf[["location_name", "prediction"]].head(10).to_string(index=False),
+            flush=True,
+        )
+
+        pred_pdf = pdf[
+            ["batch_id", "sample_id", "location_name", "prediction", "capture_time", "lat", "lon"]
+            + features
         ]
-    )
 
-    # Spark dayofweek: 1=Sunday .. 7=Saturday. Python weekday(): Monday=0 .. Sunday=6.
-    dow_py = ((dayofweek(col("event_time")) + lit(5)) % lit(7)).cast("int")
+        write_mongo_pandas(pdf.drop(columns=["prediction"]), MONGO_PREPROCESSED_COLLECTION)
+        write_mongo_pandas(pred_pdf, MONGO_PREDICTIONS_COLLECTION)
+        print(f"[batch {batch_id}] Mongo OK -> {MONGO_DB}", flush=True)
 
-    enriched = (
-        base.withColumn("Hour", hour(col("event_time")))
-        .withColumn("Minute", minute(col("event_time")))
-        .withColumn("DayOfWeek", dow_py)
-        .withColumn("Day", col("DayOfWeek"))
-        .withColumn("IsWeekend", when(col("DayOfWeek") >= lit(5), lit(1)).otherwise(lit(0)))
-        .withColumnRenamed("sample_id", "ID")
-        .withColumnRenamed("current_speed", "CurrentSpeed")
-        .withColumnRenamed("free_flow_speed", "FreeFlowSpeed")
-        .withColumnRenamed("current_travel_time", "CurrentTravelTime")
-        .withColumnRenamed("free_flow_travel_time", "FreeFlowTravelTime")
-        .withColumnRenamed("confidence", "Confidence")
-    )
-
-    feature_df = enriched.select(
-        "capture_time",
-        "lat",
-        "lon",
-        *MODEL_FEATURES,
-    )
-
-    pdf = feature_df.toPandas()
-    if pdf.empty:
-        return
-
-    for c in MODEL_FEATURES:
-        pdf[c] = pd.to_numeric(pdf[c], errors="coerce")
-
-    pdf = pdf.dropna(subset=MODEL_FEATURES)
-    if pdf.empty:
-        return
-
-    model = get_model()
-    X = pdf[MODEL_FEATURES]
-    pdf["prediction"] = model.predict(X)
-    pdf["batch_id"] = int(batch_id)
-
-    print(f"[batch {batch_id}] predictions (sample):", flush=True)
-    print(pdf[["ID", "prediction"]].head(15).to_string(index=False), flush=True)
-
-    pre_pdf = pdf.drop(columns=["prediction"], errors="ignore")
-    pred_pdf = pdf[["batch_id", "ID", "prediction", "capture_time", "lat", "lon"]].rename(
-        columns={"ID": "sample_id"}
-    )
-
-    pre_spark = spark.createDataFrame(pre_pdf)
-    pred_spark = spark.createDataFrame(pred_pdf)
-
-    (
-        pre_spark.write.format("mongodb")
-        .mode("append")
-        .option("spark.mongodb.write.connection.uri", MONGO_PREPROCESSED_URI)
-        .save()
-    )
-    (
-        pred_spark.write.format("mongodb")
-        .mode("append")
-        .option("spark.mongodb.write.connection.uri", MONGO_PREDICTIONS_URI)
-        .save()
-    )
+    except Exception:
+        print(f"[batch {batch_id}] ERROR:", flush=True)
+        traceback.print_exc()
+        raise
 
 
 query = (
